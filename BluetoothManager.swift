@@ -171,6 +171,7 @@ extension BluetoothManager: CBPeripheralDelegate {
         guard error == nil, let data = characteristic.value else { return }
 
         if characteristic.uuid == Constants.clsCharacteristicUUID {
+            print("RX CLS Data: \(data.hexEncodedString())")
 
             let transmitEnabled = Store.shared.transmitEnabled
             //guard let clsReading = CLSReading(data, transmitEnabled: transmitEnabled, transmitThousandHzEnabled: Store.shared.transmitThousandHzEnabled) else { return }

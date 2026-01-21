@@ -31,23 +31,50 @@ extension CLSReading {
           transmitEnabled: Bool,
           transmitThousandHzEnabled: Bool,
           currentStream: StreamType) {
-        guard let string = String(data: clsData, encoding: .ascii)?
+
+        let string = String(data: clsData, encoding: .ascii)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        else {
-            return nil
+        if let string = string {
+            print("ADRIANSTR = ", string)
         }
-        print("ADRIANSTR = ", string)
 
-        // New logic for TableTop (Adrian STR)
-        // Ensure no legacy delimiters exist
-        if !string.contains("W") && !string.contains("Z") && !string.contains("x") {
-             // Sanitize: remove whitespace/newlines
-             let cleanString = string.replacingOccurrences(of: "\\s", with: "", options: .regularExpression)
+        // 1. Try Legacy Logic first: Look for markers ("W", "Z", "x") in ASCII string
+        if let string = string, (string.contains("W") || string.contains("Z") || string.contains("x")) {
+             // Fall through to existing legacy parsing logic below
+        } else {
+             // 2. TableTop (Adrian STR) / Standard BLE Logic: Parse raw Data bytes
+             // The device might send raw binary, or a hex string.
+             // If 'string' conversion failed OR no legacy markers found, try treating as TableTop format.
 
-             // Check if it's hex and has minimum length for ICP (5 bytes = 10 hex chars)
-             let isHex = cleanString.allSatisfy { $0.isHexDigit }
+             // Check if it's potentially an ASCII Hex String (per documentation "This is the string you will receive...")
+             var dataToParse: Data = clsData
+             var isHexString = false
 
-             if isHex && cleanString.count >= 6 {
+             if let str = string {
+                 let cleanString = str.replacingOccurrences(of: "\\s", with: "", options: .regularExpression)
+                 if !cleanString.isEmpty && cleanString.allSatisfy({ $0.isHexDigit }) && cleanString.count % 2 == 0 {
+                     // It looks like a valid hex string. Convert back to Data bytes.
+                     var hexData = Data()
+                     var temp = ""
+                     for char in cleanString {
+                         temp.append(char)
+                         if temp.count == 2 {
+                             if let byte = UInt8(temp, radix: 16) {
+                                 hexData.append(byte)
+                             }
+                             temp = ""
+                         }
+                     }
+                     if !hexData.isEmpty {
+                         dataToParse = hexData
+                         isHexString = true
+                     }
+                 }
+             }
+
+             // Now parse 'dataToParse' as BPS/ICP structure (IEEE 11073-20601 SFloat)
+             // Minimum length: 3 bytes (Flags + SFloat) for ICP
+             if dataToParse.count >= 3 {
                  func parseSFloat(_ value: UInt16) -> Double {
                      var exponent = Int((value & 0xF000) >> 12)
                      if exponent >= 8 { exponent -= 16 }
@@ -61,63 +88,48 @@ extension CLSReading {
                      return Double(mantissa) * pow(10.0, Double(exponent))
                  }
 
-                 var data = Data()
-                 var temp = ""
-                 for char in cleanString {
-                     temp.append(char)
-                     if temp.count == 2 {
-                         if let byte = UInt8(temp, radix: 16) {
-                             data.append(byte)
-                         }
-                         temp = ""
-                     }
-                 }
-
                  var extractedPressure: Double = 0.0
+                 let flags = dataToParse[0]
+                 let units = (flags & 0x01) == 0 ? "mmHg" : "kPa"
 
-                 if !data.isEmpty {
-                     let flags = data[0]
-                     let units = (flags & 0x01) == 0 ? "mmHg" : "kPa"
+                 // Heuristic: BPS Notification is usually longer (>= 7 bytes)
+                 if dataToParse.count >= 7 {
+                     let sysRaw = UInt16(dataToParse[1]) | (UInt16(dataToParse[2]) << 8)
+                     let diaRaw = UInt16(dataToParse[3]) | (UInt16(dataToParse[4]) << 8)
+                     let meanRaw = UInt16(dataToParse[5]) | (UInt16(dataToParse[6]) << 8)
 
-                     // BPS Notification (min 7 bytes)
-                     if data.count >= 7 {
-                         let sysRaw = UInt16(data[1]) | (UInt16(data[2]) << 8)
-                         let diaRaw = UInt16(data[3]) | (UInt16(data[4]) << 8)
-                         let meanRaw = UInt16(data[5]) | (UInt16(data[6]) << 8)
+                     let sys = parseSFloat(sysRaw)
+                     let dia = parseSFloat(diaRaw)
+                     let mean = parseSFloat(meanRaw)
 
-                         let sys = parseSFloat(sysRaw)
-                         let dia = parseSFloat(diaRaw)
-                         let mean = parseSFloat(meanRaw)
+                     var output = "BPS Notification: Sys: \(sys) \(units), Dia: \(dia) \(units), Mean: \(mean) \(units)"
 
-                         var output = "BPS Notification: Sys: \(sys) \(units), Dia: \(dia) \(units), Mean: \(mean) \(units)"
-
-                         var offset = 7
-                         if (flags & 0x02) != 0 { offset += 7 } // Timestamp
-                         if (flags & 0x04) != 0 { // Pulse Rate
-                             if data.count >= offset + 2 {
-                                 let pulseRaw = UInt16(data[offset]) | (UInt16(data[offset+1]) << 8)
-                                 let pulse = parseSFloat(pulseRaw)
-                                 output += ", Pulse: \(pulse) bpm"
-                                 offset += 2
-                             }
+                     var offset = 7
+                     if (flags & 0x02) != 0 { offset += 7 } // Timestamp
+                     if (flags & 0x04) != 0 { // Pulse Rate
+                         if dataToParse.count >= offset + 2 {
+                             let pulseRaw = UInt16(dataToParse[offset]) | (UInt16(dataToParse[offset+1]) << 8)
+                             let pulse = parseSFloat(pulseRaw)
+                             output += ", Pulse: \(pulse) bpm"
+                             offset += 2
                          }
-                         if (flags & 0x08) != 0 { offset += 1 } // User ID
-                         if (flags & 0x10) != 0 { // Status
-                             if data.count >= offset + 2 {
-                                 let status = UInt16(data[offset]) | (UInt16(data[offset+1]) << 8)
-                                 output += ", Status: 0x\(String(format:"%04X", status))"
-                                 offset += 2
-                             }
+                     }
+                     if (flags & 0x08) != 0 { offset += 1 } // User ID
+                     if (flags & 0x10) != 0 { // Status
+                         if dataToParse.count >= offset + 2 {
+                             let status = UInt16(dataToParse[offset]) | (UInt16(dataToParse[offset+1]) << 8)
+                             output += ", Status: 0x\(String(format:"%04X", status))"
+                             offset += 2
                          }
-                         print(output)
                      }
-                     // ICP Indication (min 3 bytes: Flags + SFloat)
-                     else if data.count >= 3 {
-                         let icpRaw = UInt16(data[1]) | (UInt16(data[2]) << 8)
-                         let icp = parseSFloat(icpRaw)
-                         extractedPressure = icp
-                         print("ICP Indication: Cuff Pressure: \(icp) \(units)")
-                     }
+                     print(output)
+                 }
+                 // ICP Indication (shorter, typically 3-5 bytes)
+                 else {
+                     let icpRaw = UInt16(dataToParse[1]) | (UInt16(dataToParse[2]) << 8)
+                     let icp = parseSFloat(icpRaw)
+                     extractedPressure = icp
+                     print("ICP Indication: Cuff Pressure: \(icp) \(units)")
                  }
 
                  // Populate DC channels with pressure to visualize on graph
@@ -127,12 +139,15 @@ extension CLSReading {
                     AC1: 0,
                     AC2: 0,
                     pktID: 0,
-                    rtPacket: string,
+                    rtPacket: string ?? dataToParse.hexEncodedString(),
                     aclReading: nil
                  )
                  return
              }
         }
+
+        // --- Legacy Logic Continuation ---
+        guard let string = string else { return nil }
 
         let neg_num = -0.9000549349935909
         let pktID: UInt16
